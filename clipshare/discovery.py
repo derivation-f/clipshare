@@ -8,15 +8,21 @@ import sys
 import time
 
 try:
-    from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceListener
+    from zeroconf import (
+        Zeroconf,
+        ServiceInfo,
+        ServiceBrowser,
+        ServiceListener,
+        NonUniqueNameException,
+    )
     HAS_ZEROCONF = True
 except ImportError:
     HAS_ZEROCONF = False
-    # Dummy types so type hints don't break
     Zeroconf = None  # type: ignore
     ServiceInfo = None  # type: ignore
     ServiceBrowser = None  # type: ignore
     ServiceListener = object  # type: ignore
+    NonUniqueNameException = Exception  # type: ignore
 
 
 SERVICE_TYPE = "_clipshare._tcp.local."
@@ -43,7 +49,13 @@ _service_info: ServiceInfo | None = None
 
 
 def register_service(port: int) -> None:
-    """Register this machine as a ClipShare service on mDNS."""
+    """Register this machine as a ClipShare service on mDNS.
+
+    If the default service name conflicts with another on the network,
+    automatically appends a suffix to make it unique.
+    If registration fails entirely, prints a warning but does not crash —
+    the receiver will still work with manual peer_host configuration.
+    """
     if not HAS_ZEROCONF:
         print("[discovery] zeroconf not installed. Install with: pip install zeroconf")
         print("[discovery] Falling back to static peer_host in clipshare.json")
@@ -53,20 +65,46 @@ def register_service(port: int) -> None:
 
     ip = _get_local_ip()
     hostname = socket.gethostname()
-
-    svc_name = f"{hostname}.{SERVICE_TYPE}"
-
-    _service_info = ServiceInfo(
-        SERVICE_TYPE,
-        svc_name,
-        addresses=[socket.inet_aton(ip)],
-        port=port,
-        properties={"hostname": hostname, "version": "1.0"},
-    )
+    base_name = f"{hostname}.{SERVICE_TYPE}"
 
     _zc = Zeroconf()
-    _zc.register_service(_service_info)
-    print(f"[discovery] Registered mDNS service: {svc_name} → {ip}:{port}")
+
+    # Try the base name first, then append -2, -3, etc. on conflict
+    max_attempts = 10
+    for attempt in range(1, max_attempts + 1):
+        if attempt == 1:
+            svc_name = base_name
+        else:
+            svc_name = f"{hostname}-{attempt}.{SERVICE_TYPE}"
+
+        try:
+            _service_info = ServiceInfo(
+                SERVICE_TYPE,
+                svc_name,
+                addresses=[socket.inet_aton(ip)],
+                port=port,
+                properties={"hostname": hostname, "version": "1.0"},
+            )
+            _zc.register_service(_service_info)
+            print(f"[discovery] Registered mDNS service: {svc_name} → {ip}:{port}")
+            return
+        except NonUniqueNameException:
+            if _service_info:
+                try:
+                    _zc.unregister_service(_service_info)
+                except Exception:
+                    pass
+            if attempt == max_attempts:
+                print(f"[discovery] Warning: Could not register unique mDNS name after {max_attempts} attempts.")
+                print("[discovery] Receiver is running but auto-discovery may not work.")
+                print("[discovery] Use manual peer_host in clipshare.json instead.")
+                return
+            continue
+        except Exception as e:
+            print(f"[discovery] Warning: mDNS registration failed: {e}")
+            print("[discovery] Receiver is running but auto-discovery may not work.")
+            print("[discovery] Use manual peer_host in clipshare.json instead.")
+            return
 
 
 def unregister_service() -> None:
